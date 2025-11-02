@@ -285,7 +285,7 @@ func NewSnapshotter(ctx context.Context, cfg *config.SnapshotterConfig) (snapsho
 		return nil, err
 	}
 
-	if err := os.Mkdir(filepath.Join(cfg.Root, "snapshots"), 0700); err != nil && !os.IsExist(err) {
+	if err := os.Mkdir(filepath.Join(cfg.Root, "snapshots"), 0o700); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
 
@@ -1038,12 +1038,12 @@ func (o *snapshotter) prepareDirectory(snapshotDir string, kind snapshots.Kind) 
 		return "", errors.Wrap(err, "failed to create temp dir")
 	}
 
-	if err := os.Mkdir(filepath.Join(td, "fs"), 0755); err != nil {
+	if err := os.Mkdir(filepath.Join(td, "fs"), 0o755); err != nil {
 		return td, err
 	}
 
 	if kind == snapshots.KindActive {
-		if err := os.Mkdir(filepath.Join(td, "work"), 0711); err != nil {
+		if err := os.Mkdir(filepath.Join(td, "work"), 0o711); err != nil {
 			return td, err
 		}
 	}
@@ -1347,7 +1347,7 @@ func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions
 		hostNativePvcPath = strings.TrimPrefix(pvcPath, "/host")
 		containerPvcPath = pvcPath // Keep /host prefix for creating directories
 	} else {
-		// Path doesn't have /host prefix (shouldn't happen in our case, but handle it)
+		// Path doesn't have /host prefix
 		hostNativePvcPath = pvcPath
 		containerPvcPath = pvcPath
 	}
@@ -1357,11 +1357,11 @@ func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions
 	containerWorkDir := filepath.Join(containerPvcPath, "work")
 
 	// Ensure upperdir and workdir exist on the host filesystem
-	if err := os.MkdirAll(containerUpperDir, 0755); err != nil {
+	if err := os.MkdirAll(containerUpperDir, 0o755); err != nil {
 		log.G(ctx).WithError(err).Errorf("Failed to create upperdir %s", containerUpperDir)
 		return nil
 	}
-	if err := os.MkdirAll(containerWorkDir, 0711); err != nil {
+	if err := os.MkdirAll(containerWorkDir, 0o711); err != nil {
 		log.G(ctx).WithError(err).Errorf("Failed to create workdir %s", containerWorkDir)
 		return nil
 	}
@@ -1518,6 +1518,10 @@ func (o *snapshotter) getPodAnnotationsFromContainer(ctx context.Context, contai
 	usePvcUpper := pod.Annotations["nydus/use-pvc-upper"]
 	if usePvcUpper != "true" {
 		return "", "", "", nil
+	}
+
+	if upperLayerPath, ok := pod.Annotations["nydus/upper-layer-path"]; ok {
+		return upperLayerPath, "", "overlayfs", nil
 	}
 
 	// Find PVC mount directory
