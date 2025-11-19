@@ -34,6 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/containerd/nydus-snapshotter/pkg/cache"
 	"github.com/containerd/nydus-snapshotter/pkg/cgroup"
@@ -1058,8 +1059,18 @@ func (o *snapshotter) getReferencedSnapshotDirs(ctx context.Context) map[string]
 	// Create in-cluster config
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		log.G(ctx).WithError(err).Warnf("Failed to create in-cluster config for cleanup check")
-		return referencedDirs
+		// Fall back to KUBECONFIG
+		kubeconfig := os.Getenv("KUBECONFIG")
+		if kubeconfig == "" {
+			log.G(ctx).WithError(err).Warnf("Failed to create in-cluster config for cleanup check")
+			return referencedDirs
+		}
+
+		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err != nil {
+			log.G(ctx).WithError(err).Warnf("Failed to create in-cluster config for cleanup check")
+			return referencedDirs
+		}
 	}
 
 	// Create Kubernetes client
@@ -1424,7 +1435,18 @@ func (o *snapshotter) labelPodWithSnapshotDir(ctx context.Context, container *co
 	// Create in-cluster config
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		return err
+		// Fall back to KUBECONFIG
+		kubeconfig := os.Getenv("KUBECONFIG")
+		if kubeconfig == "" {
+			log.G(ctx).WithError(err).Warnf("Failed to create in-cluster config for labeling")
+			return err
+		}
+
+		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err != nil {
+			log.G(ctx).WithError(err).Warnf("Failed to create in-cluster config for labeling")
+			return err
+		}
 	}
 
 	// Create Kubernetes client
@@ -1483,10 +1505,21 @@ func (o *snapshotter) getPodAnnotationsFromContainer(ctx context.Context, contai
 		return "", "", "", errors.New("container missing io.kubernetes.pod.namespace label")
 	}
 
-	// Create in-cluster config
+	// Try in-cluster config first
 	config, err := rest.InClusterConfig()
 	if err != nil {
-		return "", "", "", err
+		// Fall back to KUBECONFIG
+		kubeconfig := os.Getenv("KUBECONFIG")
+		if kubeconfig == "" {
+			// home, _ := os.UserHomeDir()
+			// kubeconfig = filepath.Join(home, ".kube", "config")
+			return "", "", "", err
+		}
+
+		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+		if err != nil {
+			return "", "", "", err
+		}
 	}
 
 	// Create Kubernetes client
