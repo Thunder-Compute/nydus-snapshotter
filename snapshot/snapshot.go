@@ -297,10 +297,18 @@ func NewSnapshotter(ctx context.Context, cfg *config.SnapshotterConfig) (snapsho
 	}
 
 	// Initialize containerd client for container queries
-	ctrdClient, err := client.New("/run/containerd/containerd.sock")
+	// Try RKE2/K3s containerd socket first, then fall back to standard containerd socket
+	ctrdSocketPath := "/run/k3s/containerd/containerd.sock"
+	if _, err := os.Stat(ctrdSocketPath); os.IsNotExist(err) {
+		ctrdSocketPath = "/run/containerd/containerd.sock"
+	}
+
+	ctrdClient, err := client.New(ctrdSocketPath)
 	if err != nil {
-		log.L.WithError(err).Warn("Failed to initialize containerd client for container queries")
+		log.L.WithError(err).Warnf("Failed to initialize containerd client at %s for container queries", ctrdSocketPath)
 		ctrdClient = nil // Continue without client, will fall back to old method
+	} else {
+		log.L.Infof("Successfully connected to containerd at %s for container queries", ctrdSocketPath)
 	}
 
 	return &snapshotter{
@@ -1326,25 +1334,35 @@ func (o *snapshotter) handleSnapshotReuse(ctx context.Context, reuseSnapshotDir 
 
 // tryPVMount attempts to create a PVC-based mount or reuse snapshot mount if the pod has the appropriate annotation
 func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions []string) []mount.Mount {
+	log.G(ctx).Infof("tryPVMount: called with key=%s overlayOptions=%v", key, overlayOptions)
 	_, container, err := o.containerBySnapshotKey(ctx, key)
-	if err != nil || container == nil {
+	if err != nil {
+		log.G(ctx).WithError(err).Warnf("tryPVMount: error looking up container by snapshot key: %s", key)
+		return nil
+	}
+	if container == nil {
+		log.G(ctx).Warnf("tryPVMount: container is nil for snapshot key: %s", key)
 		return nil
 	}
 
 	pvcPath, reuseSnapshotPath, overlayType, err := o.getPodAnnotationsFromContainer(ctx, container)
 	if err != nil {
+		log.G(ctx).WithError(err).Warnf("tryPVMount: error getting pod annotations from container")
 		return nil
 	}
 
+	log.G(ctx).Debugf("tryPVMount: pvcPath=%s, reuseSnapshotPath=%s, overlayType=%s", pvcPath, reuseSnapshotPath, overlayType)
+
 	// Handle snapshot reuse case
 	if reuseSnapshotPath != "" {
+		log.G(ctx).Infof("tryPVMount: Handling snapshot reuse for path: %s", reuseSnapshotPath)
 		return o.handleSnapshotReuse(ctx, reuseSnapshotPath, overlayOptions)
 	}
 
 	// If pvcPath is empty but we got here, check if we need to label for snapshot reuse
 	if pvcPath == "" {
+		log.G(ctx).Debugf("tryPVMount: pvcPath is empty, labeling pod for snapshot reuse scenario for key: %s", key)
 		// Check if this is the first container with snapshot reuse enabled
-		// In this case, we should label the pod with the current snapshot's upper directory
 		o.labelFirstSnapshotForReuse(ctx, key, container)
 		return nil
 	}
@@ -1357,15 +1375,18 @@ func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions
 		// Path found via /host/proc/mounts - we have the host-native path
 		hostNativePvcPath = strings.TrimPrefix(pvcPath, "/host")
 		containerPvcPath = pvcPath // Keep /host prefix for creating directories
+		log.G(ctx).Debugf("tryPVMount: Detected /host prefix. hostNativePvcPath=%s, containerPvcPath=%s", hostNativePvcPath, containerPvcPath)
 	} else {
 		// Path doesn't have /host prefix
 		hostNativePvcPath = pvcPath
 		containerPvcPath = pvcPath
+		log.G(ctx).Debugf("tryPVMount: No /host prefix. hostNativePvcPath=%s, containerPvcPath=%s", hostNativePvcPath, containerPvcPath)
 	}
 
 	// Create upperdir and workdir paths under the PVC mount using container-accessible path
 	containerUpperDir := filepath.Join(containerPvcPath, "upper")
 	containerWorkDir := filepath.Join(containerPvcPath, "work")
+	log.G(ctx).Debugf("tryPVMount: ensuring upperdir %s and workdir %s exist (container view)", containerUpperDir, containerWorkDir)
 
 	// Ensure upperdir and workdir exist on the host filesystem
 	if err := os.MkdirAll(containerUpperDir, 0o755); err != nil {
@@ -1379,21 +1400,26 @@ func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions
 
 	// Verify directories were created successfully
 	if _, err := os.Stat(containerUpperDir); err != nil {
+		log.G(ctx).WithError(err).Errorf("upperdir %s does not exist after creation", containerUpperDir)
 		return nil
 	}
 	if _, err := os.Stat(containerWorkDir); err != nil {
+		log.G(ctx).WithError(err).Errorf("workdir %s does not exist after creation", containerWorkDir)
 		return nil
 	}
 
 	// Use host-native paths for overlay mount options
 	upperDir := filepath.Join(hostNativePvcPath, "upper")
 	workDir := filepath.Join(hostNativePvcPath, "work")
+	log.G(ctx).Debugf("tryPVMount: Using host-native overlay dirs: upperdir=%s workdir=%s", upperDir, workDir)
 
 	// Remove existing upperdir/workdir options and add PVC-based paths
 	var newOptions []string
 	for _, option := range overlayOptions {
 		if !strings.HasPrefix(option, "upperdir=") && !strings.HasPrefix(option, "workdir=") {
 			newOptions = append(newOptions, option)
+		} else {
+			log.G(ctx).Debugf("tryPVMount: Removing overlay option %s", option)
 		}
 	}
 	newOptions = append(newOptions,
@@ -1406,11 +1432,14 @@ func (o *snapshotter) tryPVMount(ctx context.Context, key string, overlayOptions
 	// Choose mount type based on overlay-type annotation
 	switch overlayType {
 	case "overlayfs":
+		log.G(ctx).Infof("tryPVMount: mounting as overlayfs")
 		return overlayMount(newOptions)
 	case "nydus-overlayfs":
+		log.G(ctx).Infof("tryPVMount: mounting as nydus-overlayfs")
 		return nydusOverlayMount(newOptions)
 	default:
 		// Default to fuse-overlayfs for backwards compatibility
+		log.G(ctx).Infof("tryPVMount: mounting as fuse-overlayfs (default)")
 		return fuseOverlayMount(newOptions)
 	}
 }
@@ -1490,88 +1519,115 @@ func (o *snapshotter) labelPodWithSnapshotDir(ctx context.Context, container *co
 
 // getPodAnnotationsFromContainer extracts PVC path, reuse snapshot path, and overlay type from pod annotations
 func (o *snapshotter) getPodAnnotationsFromContainer(ctx context.Context, container *containers.Container) (pvcPath, reuseSnapshotPath, overlayType string, err error) {
+	log.G(ctx).Infof("[getPodAnnotationsFromContainer] Called")
 	if container == nil {
+		log.G(ctx).Infof("[getPodAnnotationsFromContainer] Provided container is nil, returning empty results")
 		return "", "", "", nil
 	}
 
 	// Extract pod information from container labels
+	log.G(ctx).Infof("[getPodAnnotationsFromContainer] Extracting pod name and namespace from container labels: %v", container.Labels)
+
 	podName, ok := container.Labels["io.kubernetes.pod.name"]
 	if !ok {
+		log.G(ctx).Infof("[getPodAnnotationsFromContainer] Container missing io.kubernetes.pod.name label. Labels: %v", container.Labels)
 		return "", "", "", errors.New("container missing io.kubernetes.pod.name label")
 	}
 
+	log.G(ctx).Infof("[getPodAnnotationsFromContainer] Extracted pod name: %s", podName)
+
 	podNamespace, ok := container.Labels["io.kubernetes.pod.namespace"]
 	if !ok {
+		log.G(ctx).Infof("[getPodAnnotationsFromContainer] Container missing io.kubernetes.pod.namespace label. Labels: %v", container.Labels)
 		return "", "", "", errors.New("container missing io.kubernetes.pod.namespace label")
 	}
 
-	// Try in-cluster config first
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		// Fall back to KUBECONFIG
-		kubeconfig := os.Getenv("KUBECONFIG")
-		if kubeconfig == "" {
-			// home, _ := os.UserHomeDir()
-			// kubeconfig = filepath.Join(home, ".kube", "config")
-			return "", "", "", err
-		}
+	log.G(ctx).Infof("[getPodAnnotationsFromContainer] Extracted pod namespace: %s", podNamespace)
 
-		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-		if err != nil {
-			return "", "", "", err
-		}
+	// Try KUBECONFIG
+	kubeconfig := os.Getenv("KUBECONFIG")
+	log.G(ctx).Infof("[getPodAnnotationsFromContainer] Using KUBECONFIG: %s", kubeconfig)
+	if kubeconfig == "" {
+		log.G(ctx).Infof("[getPodAnnotationsFromContainer] KUBECONFIG environment variable is not set")
+		log.G(ctx).WithError(err).Warnf("Failed to create in-cluster config for getting pod annotations")
+		return "", "", "", err
+	}
+
+	log.G(ctx).Infof("[getPodAnnotationsFromContainer] Building Kubernetes config from KUBECONFIG")
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		log.G(ctx).WithError(err).Warnf("[getPodAnnotationsFromContainer] Failed to create client config using KUBECONFIG: %s", kubeconfig)
+		return "", "", "", err
 	}
 
 	// Create Kubernetes client
+	log.G(ctx).Infof("[getPodAnnotationsFromContainer] Creating Kubernetes client from config")
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
+		log.G(ctx).Infof("[getPodAnnotationsFromContainer] Failed to create clientset: %v", err)
 		return "", "", "", err
 	}
 
 	// Get the specific pod directly
+	log.G(ctx).Infof("[getPodAnnotationsFromContainer] Retrieving pod %s/%s from API server", podNamespace, podName)
 	pod, err := clientset.CoreV1().Pods(podNamespace).Get(context.Background(), podName, metav1.GetOptions{})
 	if err != nil {
+		log.G(ctx).Infof("[getPodAnnotationsFromContainer] Failed to get pod %s/%s: %v", podNamespace, podName, err)
 		return "", "", "", errors.Wrapf(err, "failed to get pod %s/%s", podNamespace, podName)
 	}
+	log.G(ctx).Infof("[getPodAnnotationsFromContainer] Retrieved pod %s/%s with annotations: %v", podNamespace, podName, pod.Annotations)
 
 	// Check if snapshot reuse is enabled
 	reuseSnapshot := pod.Annotations["nydus/reuse-snapshot"]
+	log.G(ctx).Infof("[getPodAnnotationsFromContainer] nydus/reuse-snapshot annotation: %s", reuseSnapshot)
 	if reuseSnapshot == "true" {
 		// Check if pod already has a snapshot directory annotation
-		if existingSnapshotDir, ok := pod.Annotations["nydus/snapshot-dir"]; ok && existingSnapshotDir != "" {
-			log.G(ctx).Infof("Reusing existing snapshot directory for pod %s/%s: %s", podNamespace, podName, existingSnapshotDir)
+		existingSnapshotDir, hasSnapshotDir := pod.Annotations["nydus/snapshot-dir"]
+		log.G(ctx).Infof("[getPodAnnotationsFromContainer] nydus/snapshot-dir annotation exists: %v, value: %s", hasSnapshotDir, existingSnapshotDir)
+		if hasSnapshotDir && existingSnapshotDir != "" {
+			log.G(ctx).Infof("[getPodAnnotationsFromContainer] Reusing existing snapshot directory for pod %s/%s: %s", podNamespace, podName, existingSnapshotDir)
 			return "", existingSnapshotDir, "", nil
 		}
-		// If no existing snapshot dir, return empty and it will be annotated later
-		log.G(ctx).Infof("First container for pod %s/%s with snapshot reuse enabled, will create and annotate snapshot dir", podNamespace, podName)
+		log.G(ctx).Infof("[getPodAnnotationsFromContainer] First container for pod %s/%s with snapshot reuse enabled, will create and annotate snapshot dir", podNamespace, podName)
 		return "", "", "", nil
 	}
 
 	// Check if use-pvc-upper is enabled (boolean)
-	usePvcUpper := pod.Annotations["nydus/use-pvc-upper"]
-	if usePvcUpper != "true" {
-		return "", "", "", nil
-	}
+	// usePvcUpper := pod.Annotations["nydus/use-pvc-upper"]
+	// log.G(ctx).Infof("[getPodAnnotationsFromContainer] nydus/use-pvc-upper annotation: %s", usePvcUpper)
+	// if usePvcUpper != "true" {
+	// 	log.G(ctx).Infof("[getPodAnnotationsFromContainer] nydus/use-pvc-upper is not enabled (not 'true'), returning empty results")
+	// 	return "", "", "", nil
+	// }
 
+	// Check for explicit upper layer path
 	if upperLayerPath, ok := pod.Annotations["nydus/upper-layer-path"]; ok {
+		log.G(ctx).Infof("[getPodAnnotationsFromContainer] Found nydus/upper-layer-path annotation: %s", upperLayerPath)
 		return upperLayerPath, "", "overlayfs", nil
 	}
 
 	// Find PVC mount directory
+	log.G(ctx).Infof("[getPodAnnotationsFromContainer] Calling findPVCMountPath for pod %s/%s", podNamespace, podName)
 	pvcPath, err = o.findPVCMountPath(ctx, pod, clientset)
 	if err != nil {
+		log.G(ctx).Infof("[getPodAnnotationsFromContainer] Failed to find PVC mount path: %v", err)
 		return "", "", "", errors.Wrap(err, "failed to find PVC mount path")
 	}
+	log.G(ctx).Infof("[getPodAnnotationsFromContainer] Result from findPVCMountPath: %s", pvcPath)
 	if pvcPath == "" {
+		log.G(ctx).Infof("[getPodAnnotationsFromContainer] PVC path is empty, returning empty results")
 		return "", "", "", nil
 	}
 
 	// Get overlay type from annotation, default to fuse-overlayfs
 	overlayType = pod.Annotations["nydus/overlay-type"]
+	log.G(ctx).Infof("[getPodAnnotationsFromContainer] nydus/overlay-type annotation: %s", overlayType)
 	if overlayType == "" {
-		overlayType = "fuse-overlayfs" // default
+		overlayType = "fuse-overlayfs"
+		log.G(ctx).Infof("[getPodAnnotationsFromContainer] No overlay type annotation set, defaulting to: %s", overlayType)
 	}
 
+	log.G(ctx).Infof("[getPodAnnotationsFromContainer] Returning pvcPath=%s, reuseSnapshotPath=\"\", overlayType=%s", pvcPath, overlayType)
 	return pvcPath, "", overlayType, nil
 }
 
