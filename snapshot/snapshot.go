@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -296,11 +297,22 @@ func NewSnapshotter(ctx context.Context, cfg *config.SnapshotterConfig) (snapsho
 		syncRemove = true
 	}
 
-	// Initialize containerd client for container queries
-	// Try RKE2/K3s containerd socket first, then fall back to standard containerd socket
+	// Initialize containerd client for container queries, wait up to 30 seconds for k3s socket
 	ctrdSocketPath := "/run/k3s/containerd/containerd.sock"
-	if _, err := os.Stat(ctrdSocketPath); os.IsNotExist(err) {
-		ctrdSocketPath = "/run/containerd/containerd.sock"
+	waitTimeout := 30   // seconds
+	waitInterval := 500 // milliseconds
+	ready := false
+
+	for i := 0; i < (waitTimeout*1000)/waitInterval; i++ {
+		if _, err := os.Stat(ctrdSocketPath); err == nil {
+			ready = true
+			break
+		}
+		time.Sleep(time.Duration(waitInterval) * time.Millisecond)
+	}
+
+	if !ready {
+		return nil, fmt.Errorf("containerd socket at %s not ready after %ds", ctrdSocketPath, waitTimeout)
 	}
 
 	ctrdClient, err := client.New(ctrdSocketPath)
